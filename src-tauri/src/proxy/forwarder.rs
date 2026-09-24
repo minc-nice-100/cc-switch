@@ -1992,7 +1992,7 @@ impl RequestForwarder {
             is_claude_adapter && matches!(resolved_claude_api_format.as_deref(), Some("anthropic"));
 
         let anthropic_beta_value = forwarded_anthropic_beta(
-            &headers,
+            headers,
             is_claude_adapter,
             codex_impersonate_claude_code,
             codex_anthropic_one_m,

@@ -7,6 +7,8 @@
 //! - 各 handler 只保留独特的业务逻辑
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
+use std::sync::Arc;
+
 use super::{
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
@@ -2833,23 +2835,24 @@ async fn log_usage(
     let dedup_scope = super::usage::parser::dedup_scope_for_app(app_type, provider_id);
     let request_id = usage.dedup_request_id(dedup_scope);
 
-    if let Err(e) = logger.log_with_calculation(
+    // 在 runtime 之外落盘：机械盘上同步写会把 tokio worker 占住。
+    UsageLogger::log_with_calculation_async(
+        Arc::clone(&state.db),
         request_id,
-        provider_id.to_string(),
-        app_type.to_string(),
-        model.to_string(),
-        request_model.to_string(),
-        pricing_model.to_string(),
-        usage,
-        latency_ms,
-        first_token_ms,
-        status_code,
-        session_id,
-        None, // provider_type
-        is_streaming,
-    ) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
-    }
+            provider_id.to_string(),
+            app_type.to_string(),
+            model.to_string(),
+            request_model.to_string(),
+            pricing_model.to_string(),
+            usage,
+            latency_ms,
+            first_token_ms,
+            status_code,
+            session_id,
+            None, // provider_type
+            is_streaming,
+        )
+        .await;
 }
 
 #[cfg(test)]

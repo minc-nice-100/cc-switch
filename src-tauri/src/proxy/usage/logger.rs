@@ -9,6 +9,7 @@ use crate::services::usage_stats::{find_model_pricing_row, is_placeholder_pricin
 use rusqlite::OptionalExtension;
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Eq)]
 struct UsageSemantic {
@@ -88,7 +89,8 @@ pub struct RequestLog {
 
 /// 使用量记录器
 pub struct UsageLogger<'a> {
-    db: &'a Database,
+    /// 同模块的 `writer`（重试队列）也要构造 logger，故放宽到 pub(super)。
+    pub(super) db: &'a Database,
 }
 
 impl<'a> UsageLogger<'a> {
@@ -425,6 +427,101 @@ impl<'a> UsageLogger<'a> {
         };
 
         self.log_request(&log)
+    }
+
+    /// [`Self::log_with_calculation`] 的异步版本：把定价解析与 SQLite 写入
+    /// 整体搬到 `spawn_blocking` 线程池。
+    ///
+    /// # 为什么需要
+    ///
+    /// `log_request` 第一行就取 `self.db.conn` 的阻塞 Mutex，而 `Database` 是
+    /// 单连接 + `Mutex<Connection>`（`database/mod.rs:77-79`），所有 DB 访问
+    /// 都串行在这把锁上。原同步版本被 `response_processor.rs:661` 与
+    /// `handlers.rs:2836` 从 tokio worker 线程直接调用——机械盘上一次 fsync
+    /// 几十毫秒就能占住一个 worker，并发请求继续在同一把锁上排队，用户看到
+    /// 的是流式转发卡顿。
+    ///
+    /// 仓库里 `commands/` 各处的 DB 调用都走 `spawn_blocking`，代理热路径是
+    /// 唯一例外，这里补齐。
+    ///
+    /// # 为什么参数是 `Arc<Database>` 而不是 `&self`
+    ///
+    /// `UsageLogger<'a>` 借的是 `&Database`，跨不进 `'static` 的 blocking
+    /// 闭包。调用方（`ProxyState`）本就持有 `Arc<Database>`，直接 move 进来
+    /// 最省事。（不能复制 `Database`：它内含 `Mutex<Connection>`，按位复制
+    /// 会让原值与副本双重释放同一把锁。）
+    ///
+    /// # 失败语义
+    ///
+    /// 写入失败时不丢记录：转入 [`super::writer`] 的重试队列。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_with_calculation_async(
+        db: Arc<Database>,
+        request_id: String,
+        provider_id: String,
+        app_type: String,
+        model: String,
+        request_model: String,
+        pricing_model: String,
+        usage: TokenUsage,
+        latency_ms: u64,
+        first_token_ms: Option<u64>,
+        status_code: u16,
+        session_id: Option<String>,
+        provider_type: Option<String>,
+        is_streaming: bool,
+    ) {
+        // 先备份一份用于失败重试：闭包会把字段逐个 move 掉。
+        let retry = super::writer::RetryLog {
+            request_id: request_id.clone(),
+            provider_id: provider_id.clone(),
+            app_type: app_type.clone(),
+            model: model.clone(),
+            request_model: request_model.clone(),
+            pricing_model: pricing_model.clone(),
+            usage: usage.clone(),
+            latency_ms,
+            first_token_ms,
+            status_code,
+            session_id: session_id.clone(),
+            provider_type: provider_type.clone(),
+            is_streaming,
+        };
+
+        let joined = tokio::task::spawn_blocking({
+            let db = Arc::clone(&db);
+            move || {
+                let logger = UsageLogger { db: &db };
+                logger.log_with_calculation(
+                    request_id,
+                    provider_id,
+                    app_type,
+                    model,
+                    request_model,
+                    pricing_model,
+                    usage,
+                    latency_ms,
+                    first_token_ms,
+                    status_code,
+                    session_id,
+                    provider_type,
+                    is_streaming,
+                )
+            }
+        })
+        .await;
+
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log::warn!("[USG-001] 记录使用量失败，转入重试队列: {error}");
+                super::writer::retry_log(db, retry);
+            }
+            Err(join_error) => {
+                log::warn!("[USG-003] 记录使用量任务异常，转入重试队列: {join_error}");
+                super::writer::retry_log(db, retry);
+            }
+        }
     }
 }
 

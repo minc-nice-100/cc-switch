@@ -658,25 +658,25 @@ async fn log_usage_internal(
         usage.cache_creation_tokens
     );
 
-    if let Err(e) = logger.log_with_calculation(
+    // 在 runtime 之外落盘：机械盘上同步写会把 tokio worker 占住。
+    UsageLogger::log_with_calculation_async(
+        Arc::clone(&state.db),
         request_id,
-        provider_id.to_string(),
-        app_type.to_string(),
-        model.to_string(),
-        request_model.to_string(),
-        pricing_model.to_string(),
-        usage,
-        latency_ms,
-        first_token_ms,
-        status_code,
-        session_id,
-        None, // provider_type
-        is_streaming,
-    ) {
-        log::warn!("[USG-001] 记录使用量失败: {e}");
-    }
+            provider_id.to_string(),
+            app_type.to_string(),
+            model.to_string(),
+            request_model.to_string(),
+            pricing_model.to_string(),
+            usage,
+            latency_ms,
+            first_token_ms,
+            status_code,
+            session_id,
+            None, // provider_type
+            is_streaming,
+        )
+        .await;
 }
-
 /// 创建带日志记录和超时控制的透传流
 pub fn create_logged_passthrough_stream(
     stream: impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,

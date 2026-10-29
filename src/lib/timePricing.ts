@@ -305,7 +305,10 @@ export function draftToTimeRule(
 
   return {
     id,
-    modelId: draft.modelId.trim(),
+    // 与后端的 normalize_time_rule 对齐：候选名那条链路会 to_ascii_lowercase，
+    // 这里不同样小写化的话，敲 "DeepSeek-Chat" 存进去的是大写，永远匹配不上
+    // 小写的候选名——规则静默失效，每次都按单一定价计费，不报错也不打日志。
+    modelId: draft.modelId.trim().toLowerCase(),
     label: draft.label.trim(),
     utcOffsetMinutes,
     weekdayMask: draft.weekdayMask,

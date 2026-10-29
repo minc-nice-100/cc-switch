@@ -94,20 +94,38 @@ fn minute_in_window(minute: u32, start: u32, end: u32) -> bool {
 }
 
 /// 本地时刻是否命中规则。纯函数：不读时钟、不碰 IO，便于测试。
+///
+/// 跨午夜窗口（`start > end`）的**后半段**——`00:00` 到 `end` 那段——在日历上
+/// 属于**前一天**：`22:00 → 08:00` 里的周一 02:00 其实是周日深夜。所以后半段
+/// 要用前一天的星期位和前一天的日子来判断，否则会同时犯两个方向的错：
+/// 只勾了工作日的规则漏掉周日夜（该打折的 8 小时全价），又莫名其妙地把用户
+/// 没勾的周一凌晨算进来（不该打折的打了折）。
 fn matches(
     rule: &ModelPricingTimeRule,
     local_weekday: Weekday,
     local_minute: u32,
     local_date: NaiveDate,
 ) -> bool {
-    if rule.weekday_mask & weekday_bit(local_weekday) == 0 {
+    // start == end 表示全天，不构成跨午夜，没有"后半段"可言。
+    let in_post_midnight_half =
+        rule.start_minute > rule.end_minute && local_minute < rule.end_minute;
+    let (effective_weekday, effective_date) = if in_post_midnight_half {
+        (local_weekday.pred(), local_date.pred_opt())
+    } else {
+        (local_weekday, Some(local_date))
+    };
+    let Some(effective_date) = effective_date else {
+        return false;
+    };
+
+    if rule.weekday_mask & weekday_bit(effective_weekday) == 0 {
         return false;
     }
     if !minute_in_window(local_minute, rule.start_minute, rule.end_minute) {
         return false;
     }
     // NaiveDate 的 Display 就是 %Y-%m-%d，与 normalize_excluded_dates 的归一化形式一致
-    !rule.excluded_dates.contains(&local_date.to_string())
+    !rule.excluded_dates.contains(&effective_date.to_string())
 }
 
 /// 把 unix 秒换算成规则本地时区里的「周几 / 当日分钟 / 本地日期」。
@@ -130,23 +148,34 @@ pub fn local_parts(offset_minutes: i32, timestamp_secs: i64) -> Option<(Weekday,
 /// DB 读取时用 `sort_order ASC, rule_id ASC` 兜底），这里只返回第一个命中项。
 /// 候选模型按 `candidates` 的顺序逐个尝试，前面的候选优先于后面的；
 /// 同一候选内按 `rules` 的顺序取第一个命中项。
+/// 按数组顺序找出第一条命中的规则；没有则 `None`。
+///
+/// **循环必须是「规则在外、候选在内」**：文档和 UI 都承诺「弹窗里的顺序就是
+/// 优先级，第一条命中的生效」。如果反过来拿候选名当外层循环，一个请求有多个
+/// 候选名时（`claude-sonnet-4.5` 同时产出 `claude-sonnet-4-5`）就会变成
+/// 「候选名顺序优先」——用户排在最上面的全天规则会被排在下面的窄窗口规则
+/// 绕过，而文档让他「往上移」是无效操作。候选名只用来判断这条规则是否适用。
 pub fn resolve_time_rule<'a>(
     rules: &'a [ModelPricingTimeRule],
     candidates: &[String],
     timestamp_secs: i64,
 ) -> Option<&'a ModelPricingTimeRule> {
-    for candidate in candidates {
-        for rule in rules {
-            if rule.model_id != *candidate {
-                continue;
-            }
-            let parts = local_parts(rule.utc_offset_minutes, timestamp_secs);
-            let Some((weekday, minute, date)) = parts else {
-                continue;
-            };
-            if matches(rule, weekday, minute, date) {
-                return Some(rule);
-            }
+    for rule in rules {
+        // 大小写不敏感地比对：`normalize_time_rule` 已经小写化，但规则也可能从
+        // 别处进来（测试直构、未来的导入路径），比对这一侧再兜一次，避免"存进去的
+        // 和比对用的不是同一个串"这种静默失效。
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&rule.model_id))
+        {
+            continue;
+        }
+        let parts = local_parts(rule.utc_offset_minutes, timestamp_secs);
+        let Some((weekday, minute, date)) = parts else {
+            continue;
+        };
+        if matches(rule, weekday, minute, date) {
+            return Some(rule);
         }
     }
     None
@@ -188,7 +217,11 @@ pub fn normalize_time_rule(
     rule: ModelPricingTimeRule,
     index: usize,
 ) -> Result<ModelPricingTimeRule, AppError> {
-    let model_id = rule.model_id.trim().to_string();
+    // 候选名是 `clean_model_id_for_pricing` 的产物，那条链路会 `to_ascii_lowercase`
+    // 并且剥掉命名空间 / `:tag`。这里必须做同样的小写化，否则用户在对话框里敲
+    // `DeepSeek-Chat` 存下来的是大写，请求侧的候选名是小写，两条字符串永远不相等
+    // ——规则静默失效，每次都按单一定价计费，不报错也不打日志，是最难发现的那类 bug。
+    let model_id = rule.model_id.trim().to_ascii_lowercase();
     if model_id.is_empty() {
         return Err(AppError::localized(
             "usage.modelIdRequired",
@@ -702,25 +735,146 @@ mod tests {
     }
 
     #[test]
-    fn resolve_time_rule_prefers_an_earlier_candidate() {
-        let mut other = sample_rule();
-        other.id = "rule-other".to_string();
-        other.model_id = "deepseek-reasoner".to_string();
-        other.start_minute = 0;
-        other.end_minute = 1440;
-        let rules = vec![sample_rule(), other];
-        // 两条都命中：靠前的候选赢，靠后的候选不能把它顶掉
+    /// 数组顺序即优先级，**不受候选名顺序影响**。
+    ///
+    /// 这条是回归测试：曾经外层循环是候选名，于是同一个请求有多个候选名时
+    /// （`claude-sonnet-4.5` 会同时产出 `claude-sonnet-4-5`）优先级实际由候选名
+    /// 顺序决定——用户排在最上面的全天规则会被排在下面的窄窗口规则绕过，而 UI
+    /// 让他「往上移」是无效操作。
+    #[test]
+    fn resolve_time_rule_lets_array_order_decide_over_candidate_order() {
+        // 靠前的规则适用「靠后的候选名」，靠后的规则适用「靠前的候选名」：
+        // 只有数组顺序真正说了算，两条候选顺序才会得到同一个答案。
+        let mut first = sample_rule();
+        first.id = "rule-first".to_string();
+        first.model_id = "deepseek-reasoner".to_string();
+        first.start_minute = 0;
+        first.end_minute = 1440;
+
+        let mut second = sample_rule();
+        second.id = "rule-second".to_string();
+        second.model_id = "deepseek-chat".to_string();
+        second.start_minute = 0;
+        second.end_minute = 1440;
+
+        let rules = vec![first, second];
         let at = SUNDAY_MIDNIGHT_UTC + 3600;
 
-        let mut candidates = vec!["deepseek-chat".to_string()];
-        candidates.push("deepseek-reasoner".to_string());
-        let resolved = resolve_time_rule(&rules, &candidates, at);
-        assert_eq!(resolved.map(|rule| rule.id.as_str()), Some("rule-1"));
+        for candidates in [
+            vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            vec!["deepseek-reasoner".to_string(), "deepseek-chat".to_string()],
+        ] {
+            assert_eq!(
+                resolve_time_rule(&rules, &candidates, at).map(|rule| rule.id.as_str()),
+                Some("rule-first"),
+                "数组在前的规则必须赢，候选名顺序不参与优先级"
+            );
+        }
+    }
 
-        // 候选顺序反转，命中的就换成 deepseek-reasoner 那条
-        candidates.reverse();
-        let resolved = resolve_time_rule(&rules, &candidates, at);
-        assert_eq!(resolved.map(|rule| rule.id.as_str()), Some("rule-other"));
+    /// 模型 ID 大小写不同也必须命中：候选名由 `clean_model_id_for_pricing`
+    /// 产出，那条链路会 `to_ascii_lowercase`；规则侧不同样小写化的话，用户在
+    /// 对话框里敲 `DeepSeek-Chat` 存下来就永远匹配不上小写的候选名——规则静默
+    /// 失效，每次都按单一定价计费，不报错也不打日志。
+    #[test]
+    fn resolve_time_rule_matches_a_model_id_that_differs_only_in_case() {
+        let mut rule = sample_rule();
+        rule.model_id = "DeepSeek-Chat".to_string();
+        let rules = vec![rule];
+        let candidates = vec!["deepseek-chat".to_string()];
+        let at = SUNDAY_MIDNIGHT_UTC + 3600;
+
+        assert_eq!(
+            resolve_time_rule(&rules, &candidates, at).map(|rule| rule.id.as_str()),
+            Some("rule-1")
+        );
+        // 归一化本身就要把小写形态存下来，否则存库的和比对用的不是同一个串
+        let normalized = normalize_time_rule(
+            ModelPricingTimeRule {
+                model_id: "  DeepSeek-Chat  ".to_string(),
+                ..sample_rule()
+            },
+            0,
+        )
+        .expect("mixed case is valid");
+        assert_eq!(normalized.model_id, "deepseek-chat");
+    }
+
+    /// 跨午夜窗口整体归属于**它开始的那一天**，后半段按前一天判断。
+    ///
+    /// `22:00 → 08:00` 且只勾工作日，覆盖的是「周一 22:00 → 周二 08:00」……
+    /// 「周五 22:00 → 周六 08:00」。周日 22:00 → 周一 08:00 那段不属于工作日夜晚。
+    ///
+    /// 曾然后半段（00:00–08:00）被当成开始那一天本身，于是周一 02:00 要求勾了
+    /// 周一才命中——可它是周日深夜；反过来周日 02:00 又会被一条勾了周日的规则
+    /// 命中，而它其实是周六凌晨。两种方向都错。
+    #[test]
+    fn a_wrapping_window_attributes_its_post_midnight_half_to_the_previous_day() {
+        let mut rule = sample_rule();
+        rule.weekday_mask = 0b0001_1111; // 周一至周五
+        rule.start_minute = 22 * 60; // 22:00
+        rule.end_minute = 8 * 60; // 08:00，跨午夜
+
+        let rules = vec![rule];
+        let candidates = vec!["deepseek-chat".to_string()];
+        let hit = |at: i64| resolve_time_rule(&rules, &candidates, at).map(|r| r.id.as_str());
+
+        // 窗口的前半段：当天勾了就命中
+        assert_eq!(
+            hit(SUNDAY_MIDNIGHT_UTC + 47 * 3600),
+            Some("rule-1"),
+            "周一 23:00"
+        );
+        // 后半段归前一天：周二 02:00 的前驱是周一（已勾）
+        assert_eq!(
+            hit(SUNDAY_MIDNIGHT_UTC + 50 * 3600),
+            Some("rule-1"),
+            "周二 02:00"
+        );
+        // 周五深夜进入周六凌晨：周五已勾，所以这一段算工作日夜晚
+        // 2026-03-01 是周日，+146h = 6 天 2 小时 = 周六 02:00
+        assert_eq!(
+            hit(SUNDAY_MIDNIGHT_UTC + 146 * 3600),
+            Some("rule-1"),
+            "周六 02:00"
+        );
+
+        // 周日 23:00：当天没勾，且它在前半段，不归前一天
+        assert_eq!(hit(SUNDAY_MIDNIGHT_UTC + 23 * 3600), None, "周日 23:00");
+        // 周一 02:00：后半段，前驱是周日，没勾
+        assert_eq!(hit(SUNDAY_MIDNIGHT_UTC + 26 * 3600), None, "周一 02:00");
+        // 周日 02:00：后半段，前驱是周六，没勾
+        assert_eq!(hit(SUNDAY_MIDNIGHT_UTC + 2 * 3600), None, "周日 02:00");
+    }
+
+    /// 全天掩码下跨午夜窗口不受影响——前后半段每天都勾，归到哪天都一样。
+    /// 这条守住「修后半段归属」没有顺手改坏原本就对的情况。
+    #[test]
+    fn a_wrapping_window_with_every_day_ticked_is_unchanged() {
+        let mut rule = sample_rule();
+        rule.weekday_mask = WEEKDAY_MASK_ALL;
+        rule.start_minute = 22 * 60;
+        rule.end_minute = 8 * 60;
+        let rules = vec![rule];
+        let candidates = vec!["deepseek-chat".to_string()];
+        // 22:00–08:00 是半开区间：命中 02:00 / 22:00 / 23:00，
+        // 不命中 08:00（右端点，开）和 13:00（窗口外）。
+        for hour in [2u32, 22, 23] {
+            let at = SUNDAY_MIDNIGHT_UTC + (hour as i64) * 3600;
+            assert_eq!(
+                resolve_time_rule(&rules, &candidates, at).map(|r| r.id.as_str()),
+                Some("rule-1"),
+                "全天规则下 {hour}:00 必须命中"
+            );
+        }
+        for hour in [8u32, 13] {
+            let at = SUNDAY_MIDNIGHT_UTC + (hour as i64) * 3600;
+            assert_eq!(
+                resolve_time_rule(&rules, &candidates, at),
+                None,
+                "全天规则下 {hour}:00 不该命中"
+            );
+        }
     }
 
     #[test]

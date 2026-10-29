@@ -12,7 +12,7 @@ use crate::services::sql_helpers::{
 use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -2210,10 +2210,16 @@ impl Database {
 
         let mut logs = Vec::new();
         let mut pricing_cache = HashMap::new();
+        let time_rule_models = model_ids_with_time_rules(&conn)?;
 
         for row in rows {
             let mut log = row?;
-            Self::maybe_backfill_log_costs(&conn, &mut log, &mut pricing_cache)?;
+            Self::maybe_backfill_log_costs(
+                &conn,
+                &mut log,
+                &mut pricing_cache,
+                &time_rule_models,
+            )?;
             logs.push(log);
         }
 
@@ -2250,7 +2256,13 @@ impl Database {
         match result {
             Ok(mut detail) => {
                 let mut pricing_cache = HashMap::new();
-                Self::maybe_backfill_log_costs(&conn, &mut detail, &mut pricing_cache)?;
+                let time_rule_models = model_ids_with_time_rules(&conn)?;
+                Self::maybe_backfill_log_costs(
+                    &conn,
+                    &mut detail,
+                    &mut pricing_cache,
+                    &time_rule_models,
+                )?;
                 Ok(Some(detail))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -2369,6 +2381,21 @@ struct PricingInfo {
     cache_creation: rust_decimal::Decimal,
 }
 
+/// 配了分时段规则的模型 ID 集合（小写，与候选名同口径）。
+///
+/// 一次回填只查一次，别放进逐行的缓存里：这张表对绝大多数用户是空的，
+/// 一次 `SELECT DISTINCT` 比逐行判断便宜得多。
+fn model_ids_with_time_rules(conn: &Connection) -> Result<HashSet<String>, AppError> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT model_id FROM model_pricing_time_rule")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        ids.insert(row?.to_ascii_lowercase());
+    }
+    Ok(ids)
+}
+
 impl Database {
     /// Recalculate stored zero-cost usage rows once pricing becomes available.
     pub(crate) fn backfill_missing_usage_costs(&self) -> Result<u64, AppError> {
@@ -2427,8 +2454,9 @@ impl Database {
 
         let mut updated = 0u64;
         let mut pricing_cache = HashMap::new();
+        let time_rule_models = model_ids_with_time_rules(&tx)?;
         for log in &mut logs {
-            if Self::maybe_backfill_log_costs(&tx, log, &mut pricing_cache)? {
+            if Self::maybe_backfill_log_costs(&tx, log, &mut pricing_cache, &time_rule_models)? {
                 updated += 1;
             }
         }
@@ -2443,10 +2471,17 @@ impl Database {
     }
 
     /// 尝试为单条 log 回填成本字段。返回是否实际写入（true=已 UPDATE，false=跳过）。
+    ///
+    /// `time_rule_models` 是配了分时段规则的模型 ID 集合，这些模型整体跳过：
+    /// 回填把 `total_cost_usd == 0` 当成「还没定价过」，可对它们来说 0 可能正是
+    /// 规则算出来的结果——使用手册里就写明可以配一个全零的免费窗口。拿基准价去
+    /// 「修」这些行，等于把用户配成免费的时段按高峰价记上账，和这个功能「不做
+    /// 成本回填」的承诺直接矛盾。
     fn maybe_backfill_log_costs(
         conn: &Connection,
         log: &mut RequestLogDetail,
         pricing_cache: &mut HashMap<String, PricingInfo>,
+        time_rule_models: &HashSet<String>,
     ) -> Result<bool, AppError> {
         let existing_cost = rust_decimal::Decimal::from_str(&log.total_cost_usd)
             .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -2457,6 +2492,13 @@ impl Database {
             || log.cache_creation_tokens > 0;
 
         if has_cost || !has_usage {
+            return Ok(false);
+        }
+
+        // pricing_model 为空说明这条行本来就没有计价模型，谈不上被规则命中
+        if time_rule_models.contains(&clean_model_id_for_pricing(
+            log.pricing_model.as_deref().unwrap_or(""),
+        )) {
             return Ok(false);
         }
 
@@ -3816,6 +3858,67 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(total_cost, "5.000000");
+
+        Ok(())
+    }
+
+    /// 配了分时段规则的模型，回填不得把 0 成本「修」成基准价。
+    ///
+    /// 使用手册写明可以配一个全零的免费窗口，那种窗口写出来的行就是
+    /// usage > 0 而 total_cost_usd = 0——和「还没定价过」长得一模一样。
+    /// 回填按基准价一算，就把用户配成免费的时段按高峰价记上了账，和这个功能
+    /// 「不做成本回填」的承诺直接矛盾。
+    ///
+    /// 对照组是 `test_backfill_missing_usage_costs_uses_new_gpt_5_5_pricing`：
+    /// 同一个模型、同一行形状，只因为没有配规则，回填照旧生效。
+    #[test]
+    fn test_backfill_leaves_zero_cost_rows_alone_for_models_with_time_rules(
+    ) -> Result<(), AppError> {
+        let db = Database::memory()?;
+
+        {
+            let conn = lock_conn!(db.conn);
+            // gpt-5.5 有基准价：1M input = $5（见上面那条对照组测试）
+            conn.execute(
+                "INSERT INTO model_pricing_time_rule (
+                    rule_id, model_id, utc_offset_minutes, weekday_mask,
+                    start_minute, end_minute,
+                    input_cost_per_million, output_cost_per_million,
+                    cache_read_cost_per_million, cache_creation_cost_per_million, sort_order
+                ) VALUES (
+                    'rule-free', 'gpt-5.5', 0, 127,
+                    0, 1440,
+                    '0', '0', '0', '0', 0
+                )",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO proxy_request_logs (
+                    request_id, provider_id, app_type, model, request_model, pricing_model,
+                    input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                    input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd,
+                    total_cost_usd, latency_ms, status_code, created_at, data_source
+                ) VALUES (
+                    'free-window-row', '_codex_session', 'codex', 'gpt-5.5', 'gpt-5.5', 'gpt-5.5',
+                    1000000, 0, 0, 0,
+                    '0', '0', '0', '0',
+                    '0', 100, 200, 1000, 'codex_session'
+                )",
+                [],
+            )?;
+        }
+
+        // 一行都不该被回填
+        assert_eq!(db.backfill_missing_usage_costs()?, 0);
+
+        let conn = lock_conn!(db.conn);
+        let total_cost: String = conn.query_row(
+            "SELECT total_cost_usd
+             FROM proxy_request_logs WHERE request_id = 'free-window-row'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(total_cost, "0", "免费窗口的行必须保持 0，不能被基准价顶掉");
 
         Ok(())
     }
